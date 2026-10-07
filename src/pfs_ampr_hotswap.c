@@ -161,26 +161,6 @@ hs_set_err(char *err, size_t err_size, const char *fmt, ...) {
   va_end(ap);
 }
 
-static int
-hs_exfat_require_contiguous_allocation(const hs_exfat_file_t *file,
-                                       const char *label,
-                                       char *err, size_t err_size) {
-  if(!file) {
-    hs_set_err(err, err_size, "bad exFAT allocation check");
-    errno = EINVAL;
-    return -1;
-  }
-  if(file->first_cluster && file->allocated_clusters &&
-     (file->stream_flags & 0x02U) == 0) {
-    hs_set_err(err, err_size,
-               "%s uses a fragmented exFAT allocation; recompress with AMPR hot-swap layout",
-               label ? label : "target file");
-    errno = EINVAL;
-    return -1;
-  }
-  return 0;
-}
-
 static uint16_t
 hs_rd16(const unsigned char *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -1855,18 +1835,15 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
   }
   uint32_t needed_clusters = (uint32_t)needed_clusters64;
   if(hs_exfat_find_ampr(ex, &file, err, err_size) != 0) return -1;
-  if(hs_exfat_require_contiguous_allocation(&file, "AMPR binary",
-                                            err, err_size) != 0) {
-    return -1;
-  }
 
   uint32_t new_first = file.first_cluster;
   uint32_t new_alloc = file.allocated_clusters;
   int tail_migrated = 0;
-  unsigned char *bitmap_final = NULL;
+  unsigned char *bitmap = NULL;
   uint64_t bitmap_off = 0;
 
-  if(needed_clusters > file.allocated_clusters) {
+  if((file.stream_flags & 0x02U) == 0 ||
+     needed_clusters > file.allocated_clusters) {
     if(hs_exfat_load_root_bitmap(ex, err, err_size) != 0) return -1;
     uint64_t bitmap_bytes64 = hs_ceil_div_u64(ex->cluster_count, 8);
     if(ex->bitmap_size < bitmap_bytes64 || ex->bitmap_size > SIZE_MAX) {
@@ -1874,7 +1851,7 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
       errno = EINVAL;
       return -1;
     }
-    unsigned char *bitmap = malloc((size_t)ex->bitmap_size);
+    bitmap = malloc((size_t)ex->bitmap_size);
     if(!bitmap) {
       hs_set_err(err, err_size, "out of memory");
       errno = ENOMEM;
@@ -1897,34 +1874,25 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
     for(uint32_t i = 0; i < new_alloc; i++) {
       hs_bitmap_set(bitmap, new_first + i, 1);
     }
-    bitmap_final = malloc((size_t)ex->bitmap_size);
-    if(!bitmap_final) {
+    if(hs_exfat_release_file_allocation(ex, &file, bitmap, patches,
+                                        err, err_size) != 0) {
       free(bitmap);
-      hs_set_err(err, err_size, "out of memory");
-      errno = ENOMEM;
       return -1;
-    }
-    memcpy(bitmap_final, bitmap, (size_t)ex->bitmap_size);
-    if(file.first_cluster && file.allocated_clusters) {
-      for(uint32_t i = 0; i < file.allocated_clusters; i++) {
-        hs_bitmap_set(bitmap_final, file.first_cluster + i, 0);
-      }
     }
     if(hs_append_fat_range_patch(ex, patches, new_first, new_alloc, 0,
                                  err, err_size) != 0 ||
        hs_patch_append(patches, bitmap_off, bitmap, (size_t)ex->bitmap_size,
                        err, err_size) != 0) {
       free(bitmap);
-      free(bitmap_final);
       return -1;
     }
     free(bitmap);
+    bitmap = NULL;
     tail_migrated = 1;
   }
 
   if(hs_append_data_patch(ex, patches, new_first, replacement,
                           replacement_size, err, err_size) != 0) {
-    free(bitmap_final);
     return -1;
   }
 
@@ -1939,21 +1907,8 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
                                                      file.entry_count));
   if(hs_patch_append(patches, file.entry_set_off, entry_set,
                      file.entry_count * 32U, err, err_size) != 0) {
-    free(bitmap_final);
     return -1;
   }
-  if(tail_migrated && file.first_cluster && file.allocated_clusters) {
-    if(hs_append_fat_range_patch(ex, patches, file.first_cluster,
-                                 file.allocated_clusters, 1,
-                                 err, err_size) != 0 ||
-       hs_patch_append(patches, bitmap_off, bitmap_final,
-                       (size_t)ex->bitmap_size, err, err_size) != 0) {
-      free(bitmap_final);
-      return -1;
-    }
-  }
-  free(bitmap_final);
-
   if(info) {
     snprintf(info->logical_path, sizeof(info->logical_path), "%s", file.rel);
     info->old_size = file.data_len;
